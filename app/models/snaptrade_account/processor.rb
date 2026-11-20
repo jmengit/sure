@@ -77,17 +77,18 @@ class SnaptradeAccount::Processor
     end
 
     def calculate_total_balance
-      if use_api_total_balance?
-        Rails.logger.debug "SnaptradeAccount::Processor - Using API total for multi-currency holdings for snaptrade_account=#{snaptrade_account.id}"
-        return snaptrade_account.current_balance || 0
-      end
-
       # Calculate total from holdings + cash for accuracy
       # SnapTrade's current_balance can sometimes be stale or just the cash value
       holdings_value = calculate_holdings_value
       cash_value = calculate_cash_balance
-
       calculated_total = holdings_value + cash_value
+
+      missing_options = missing_open_options
+      if use_api_total_balance?(missing_options, calculated_total)
+        capture_partial_positions(missing_options, calculated_total) if missing_options.any?
+        Rails.logger.debug "SnaptradeAccount::Processor - Using API total for incomplete or multi-currency holdings for snaptrade_account=#{snaptrade_account.id}"
+        return snaptrade_account.current_balance
+      end
 
       # Use calculated total if we have holdings, otherwise trust API value.
       # Net short positions (a short option on its own) make it negative; then
@@ -179,10 +180,86 @@ class SnaptradeAccount::Processor
       positions_complete && snaptrade_account.non_primary_cash_entries.none? { |entry| parse_decimal(entry[:amount])&.nonzero? }
     end
 
-    def use_api_total_balance?
-      return false unless snaptrade_account.current_balance.present?
+    def use_api_total_balance?(missing_options = missing_open_options, calculated_total = nil)
+      api_total = snaptrade_account.current_balance
+      return false unless api_total.present?
+      return true if holdings_currencies.any? { |currency| currency.present? && currency != snaptrade_account.currency }
+      return false if missing_options.empty?
 
-      holdings_currencies.any? { |currency| currency.present? && currency != snaptrade_account.currency }
+      missing_short = missing_options.any? { |option| option[:quantity].negative? }
+      missing_short || calculated_total.nil? || api_total > calculated_total
+    end
+
+    def missing_open_options
+      return [] unless activity_history_complete?
+
+      open_options = Hash.new(BigDecimal("0"))
+
+      Array(snaptrade_account.raw_activities_payload).each do |activity|
+        data = activity.respond_to?(:with_indifferent_access) ? activity.with_indifferent_access : {}
+        option = data[:option_symbol]
+        next unless option.respond_to?(:with_indifferent_access)
+
+        ticker = option.with_indifferent_access[:ticker].to_s.upcase.strip
+        quantity = parse_decimal(data[:units])
+        next if ticker.blank? || quantity.nil?
+
+        sign = SnaptradeAccount::ActivitiesProcessor::ACTIVITY_RULES.dig(data[:type].to_s.upcase, :sign)
+        quantity = case sign
+        when :preserve
+          quantity
+        when :sell
+          -quantity.abs
+        else
+          quantity.abs
+        end
+
+        open_options[ticker] += quantity
+      end
+
+      position_tickers = Array(snaptrade_account.raw_holdings_payload).filter_map do |holding|
+        data = holding.respond_to?(:with_indifferent_access) ? holding.with_indifferent_access : {}
+        symbol_data = extract_symbol_data(data)
+        next unless option_symbol?(symbol_data)
+
+        ticker = symbol_data[:symbol].to_s.upcase.strip
+        ticker if ticker.present?
+      end.to_set
+
+      open_options.filter_map do |ticker, quantity|
+        { ticker: ticker, quantity: quantity } if quantity.nonzero? && !position_tickers.include?(ticker)
+      end
+    end
+
+    def activity_history_complete?
+      return false if snaptrade_account.sync_start_date.present?
+
+      first_transaction_date = snaptrade_account.raw_payload.to_h.dig("sync_status", "transactions", "first_transaction_date")
+      first_activity_date = Array(snaptrade_account.raw_activities_payload).filter_map do |activity|
+        data = activity.respond_to?(:with_indifferent_access) ? activity.with_indifferent_access : {}
+        parse_date(data[:trade_date] || data[:settlement_date] || data[:date])
+      end.min
+
+      first_transaction_on = parse_date(first_transaction_date)
+      first_transaction_on && first_activity_date && first_activity_date <= first_transaction_on
+    end
+
+    def capture_partial_positions(missing_options, calculated_total)
+      DebugLogEntry.capture(
+        category: "provider_sync",
+        level: "warn",
+        message: "Using SnapTrade account total because open option positions are missing",
+        source: self.class.name,
+        provider_key: "snaptrade",
+        family: snaptrade_account.snaptrade_item.family,
+        account_provider: snaptrade_account.account_provider,
+        metadata: {
+          snaptrade_account_id: snaptrade_account.id,
+          missing_options: missing_options.map { |option| { ticker: option[:ticker], quantity: option[:quantity].to_s } },
+          provider_total: snaptrade_account.current_balance.to_s,
+          calculated_total: calculated_total.to_s
+        }
+      )
     end
 
     def holdings_currencies
