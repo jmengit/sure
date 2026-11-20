@@ -159,6 +159,167 @@ class SnaptradeAccountProcessorTest < ActiveSupport::TestCase
     assert_equal "CHF", @account.currency
   end
 
+  test "processor uses API total when an open option is missing from positions" do
+    security = securities(:aapl)
+    Account.any_instance.stubs(:set_current_balance)
+    DebugLogEntry.expects(:capture).with do |attrs|
+      attrs[:provider_key] == "snaptrade" &&
+        attrs[:account_provider] == @snaptrade_account.account_provider &&
+        attrs.dig(:metadata, :missing_options) == [ { ticker: "AAPL  261218C00240000", quantity: "1.0" } ]
+    end
+
+    @snaptrade_account.update!(
+      currency: "USD",
+      current_balance: BigDecimal("4700.00"),
+      cash_balance: BigDecimal("1000.00"),
+      raw_payload: account_payload_with_first_transaction_date(2.days.ago.to_date),
+      raw_holdings_payload: [
+        { "instrument" => { "kind" => "stock", "symbol" => security.ticker }, "units" => "20", "price" => "150.00", "currency" => "USD" }
+      ],
+      raw_activities_payload: [
+        option_trade("open-1", "OPTION_BUY", units: 1, price: 7, amount: -700, date: 2.days.ago.to_date.to_s)
+      ]
+    )
+
+    SnaptradeAccount::Processor.new(@snaptrade_account).process
+
+    assert_equal BigDecimal("4700.00"), @account.reload.balance
+  end
+
+  test "processor keeps itemized total when a missing long option leaves the API total lower" do
+    security = securities(:aapl)
+    Account.any_instance.stubs(:set_current_balance)
+
+    @snaptrade_account.update!(
+      currency: "USD",
+      current_balance: BigDecimal("3500.00"),
+      cash_balance: BigDecimal("1000.00"),
+      raw_payload: account_payload_with_first_transaction_date(2.days.ago.to_date),
+      raw_holdings_payload: [
+        { "instrument" => { "kind" => "stock", "symbol" => security.ticker }, "units" => "20", "price" => "150.00", "currency" => "USD" }
+      ],
+      raw_activities_payload: [
+        option_trade("open-1", "OPTION_BUY", units: 1, price: 7, amount: -700, date: 2.days.ago.to_date.to_s)
+      ]
+    )
+
+    SnaptradeAccount::Processor.new(@snaptrade_account).process
+
+    assert_equal BigDecimal("4000.00"), @account.reload.balance
+  end
+
+  test "processor uses lower API total when a missing short option omits its liability" do
+    security = securities(:aapl)
+    Account.any_instance.stubs(:set_current_balance)
+    DebugLogEntry.expects(:capture)
+
+    @snaptrade_account.update!(
+      currency: "USD",
+      current_balance: BigDecimal("3500.00"),
+      cash_balance: BigDecimal("1000.00"),
+      raw_payload: account_payload_with_first_transaction_date(2.days.ago.to_date),
+      raw_holdings_payload: [
+        { "instrument" => { "kind" => "stock", "symbol" => security.ticker }, "units" => "20", "price" => "150.00", "currency" => "USD" }
+      ],
+      raw_activities_payload: [
+        option_trade("open-1", "OPTION_SELL", units: 1, price: 5, amount: 500, date: 2.days.ago.to_date.to_s)
+      ]
+    )
+
+    SnaptradeAccount::Processor.new(@snaptrade_account).process
+
+    assert_equal BigDecimal("3500.00"), @account.reload.balance
+  end
+
+  test "processor does not treat a closed option as missing from positions" do
+    security = securities(:aapl)
+    Account.any_instance.stubs(:set_current_balance)
+
+    @snaptrade_account.update!(
+      currency: "USD",
+      current_balance: BigDecimal("9999.00"),
+      cash_balance: BigDecimal("1000.00"),
+      raw_payload: account_payload_with_first_transaction_date(3.days.ago.to_date),
+      raw_holdings_payload: [
+        { "instrument" => { "kind" => "stock", "symbol" => security.ticker }, "units" => "20", "price" => "150.00", "currency" => "USD" }
+      ],
+      raw_activities_payload: [
+        option_trade("open-1", "OPTION_BUY", units: 1, price: 7, amount: -700, date: 3.days.ago.to_date.to_s),
+        option_trade("close-1", "OPTION_SELL", units: 1, price: 8, amount: 800, date: 2.days.ago.to_date.to_s)
+      ]
+    )
+
+    SnaptradeAccount::Processor.new(@snaptrade_account).process
+
+    assert_equal BigDecimal("4000.00"), @account.reload.balance
+  end
+
+  test "processor ignores unmatched option activity when stored history starts late" do
+    security = securities(:aapl)
+    Account.any_instance.stubs(:set_current_balance)
+
+    @snaptrade_account.update!(
+      currency: "USD",
+      current_balance: BigDecimal("9999.00"),
+      cash_balance: BigDecimal("1000.00"),
+      sync_start_date: 30.days.ago.to_date,
+      raw_payload: account_payload_with_first_transaction_date(1.year.ago.to_date),
+      raw_holdings_payload: [
+        { "instrument" => { "kind" => "stock", "symbol" => security.ticker }, "units" => "20", "price" => "150.00", "currency" => "USD" }
+      ],
+      raw_activities_payload: [
+        option_trade("close-only", "OPTION_SELL", units: 1, price: 8, amount: 800, date: 2.days.ago.to_date.to_s)
+      ]
+    )
+
+    SnaptradeAccount::Processor.new(@snaptrade_account).process
+
+    assert_equal BigDecimal("4000.00"), @account.reload.balance
+  end
+
+  test "processor keeps itemized total when the open option is present in positions" do
+    security = securities(:aapl)
+    Account.any_instance.stubs(:set_current_balance)
+
+    @snaptrade_account.update!(
+      currency: "USD",
+      current_balance: BigDecimal("9999.00"),
+      cash_balance: BigDecimal("1000.00"),
+      raw_payload: account_payload_with_first_transaction_date(3.days.ago.to_date),
+      raw_holdings_payload: [
+        { "instrument" => { "kind" => "stock", "symbol" => security.ticker }, "units" => "20", "price" => "150.00", "currency" => "USD" },
+        option_position("AAPL  261218C00240000", "CALL", units: "1", price: "7")
+      ],
+      raw_activities_payload: [
+        option_trade("open-1", "OPTION_BUY", units: 1, price: 7, amount: -700, date: 2.days.ago.to_date.to_s)
+      ]
+    )
+
+    SnaptradeAccount::Processor.new(@snaptrade_account).process
+
+    assert_equal BigDecimal("4700.00"), @account.reload.balance
+  end
+
+  test "processor keeps itemized total when API total is stale or cash only" do
+    security = securities(:aapl)
+    Account.any_instance.stubs(:set_current_balance)
+
+    @snaptrade_account.update!(
+      currency: "USD",
+      current_balance: BigDecimal("9999.00"),
+      cash_balance: BigDecimal("1000.00"),
+      raw_payload: account_payload_with_first_transaction_date(3.days.ago.to_date),
+      raw_holdings_payload: [
+        { "instrument" => { "kind" => "stock", "symbol" => security.ticker }, "units" => "20", "price" => "150.00", "currency" => "USD" }
+      ],
+      raw_activities_payload: []
+    )
+
+    SnaptradeAccount::Processor.new(@snaptrade_account).process
+
+    assert_equal BigDecimal("4000.00"), @account.reload.balance
+  end
+
   # === /positions/all payload shape ===
 
   test "holdings processor creates holdings from a positions/all payload" do
@@ -1113,6 +1274,10 @@ class SnaptradeAccountProcessorTest < ActiveSupport::TestCase
   private
 
     OCC = "AAPL  261218C00240000".freeze
+
+    def account_payload_with_first_transaction_date(date)
+      { "sync_status" => { "transactions" => { "first_transaction_date" => date.to_s } } }
+    end
 
     def sync_positions!(positions, activities = [], total: 1000, **attrs)
       @snaptrade_account.update!(currency: "USD", cash_balance: 1000, current_balance: total, last_holdings_sync: Time.current,
